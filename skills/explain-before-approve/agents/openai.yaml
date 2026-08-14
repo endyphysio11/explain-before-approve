@@ -1,0 +1,4 @@
+interface:
+  display_name: "Explain Before Approve"
+  short_description: "Explain agent actions before approval"
+  default_prompt: "Use $explain-before-approve to explain this coding-agent action before I approve it."
