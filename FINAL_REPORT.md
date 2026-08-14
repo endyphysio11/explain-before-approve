@@ -98,7 +98,7 @@ The repository also underwent a scan for common private-key, cloud-key, GitHub-t
 
 - Additional domain patterns, host-specific integrations, and broader compatibility certification are deferred beyond v0.1.
 - Automatic interception, automatic approval, execution, cloud services, telemetry, IAM, and enterprise policy remain explicit non-goals.
-- The first post-release hardening was committed and pushed to `origin/main` as `0a7cdc1b4a9616afa795efca243ca62644380347`. The second-audit corrections were committed and pushed to `origin/main` as `fb1814fd36887a18ce99c7c08cc0a8fc61135668`. The current final focused correction remains intentionally uncommitted and unpushed; no tag, release, package, or deployment was created.
+- The post-release hardening and final focused corrections are included in the current `main` branch. No tag, GitHub Release, package publication, or deployment has been created.
 
 ## Goal Contract Verification
 
