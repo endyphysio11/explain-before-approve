@@ -49,7 +49,7 @@ SECRET_FILE_RE = re.compile(
     r"etc/(?:(?:shadow|gshadow)(?:[-.][\w.-]+)?|master\.passwd|security/(?:opasswd|passwd))|"
     r"(?:credentials|secrets)(?:\.(?:json|ya?ml|toml|ini))?|service[-_]?account(?:\.json)?|\.aws/credentials|"
     r"\.ssh/(?:config|authorized_keys)|\.npmrc|\.pypirc|\.netrc|"
-    r"\.docker/config\.json|\.kube/config|application_default_credentials\.json|"
+    r"\.docker/config\.json|\.kube/config|\.config/gh/hosts\.ya?ml|application_default_credentials\.json|"
     r"\.git-credentials|\.pgpass|\.mylogin\.cnf|\.vault-token|\.htpasswd|"
     r"(?:private|client|server)[-_]?[\w.-]*\.(?:pem|key))"
     r"(?:$|[\s'\"])",
@@ -73,6 +73,26 @@ SECRET_VAR_RE = re.compile(
     re.IGNORECASE,
 )
 SECRET_NAME_RE = re.compile(r"^" + SECRET_NAME_PATTERN + r"$", re.IGNORECASE)
+SECRET_LITERAL_VALUE_PATTERN = r"[A-Za-z0-9_./+=:@-]{12,}"
+SECRET_ASSIGNMENT_LITERAL_RE = re.compile(
+    r"(?<![A-Za-z0-9_-])(?P<prefix>" + SECRET_NAME_PATTERN + r"\s*(?:=|:)\s*['\"]?)"
+    r"(?P<value>" + SECRET_LITERAL_VALUE_PATTERN + r")",
+    re.IGNORECASE,
+)
+AUTHORIZATION_LITERAL_RE = re.compile(
+    r"(?P<prefix>Authorization\s*:\s*(?:Bearer|token|Basic)\s+)"
+    r"(?P<value>" + SECRET_LITERAL_VALUE_PATTERN + r")",
+    re.IGNORECASE,
+)
+WELL_KNOWN_TOKEN_RE = re.compile(
+    r"(?<![A-Za-z0-9_-])(?:"
+    r"gh[pousr]_[A-Za-z0-9_]{16,}|"
+    r"github_pat_[A-Za-z0-9_]{20,}|"
+    r"AKIA[0-9A-Z]{16}|"
+    r"sk-[A-Za-z0-9_-]{20,}|"
+    r"xox[baprs]-[A-Za-z0-9-]{16,}"
+    r")(?![A-Za-z0-9_-])",
+)
 SECRET_ENVIRONMENT_GETTER_RE = re.compile(
     r"\[\s*(?:System\.)?Environment\s*\]\s*::\s*GetEnvironmentVariable\s*\(\s*"
     r"['\"]\s*" + SECRET_NAME_PATTERN + r"\s*['\"]\s*\)",
@@ -123,6 +143,28 @@ def _unique(items: list[str]) -> list[str]:
             seen.add(item)
             result.append(item)
     return result
+
+
+def _has_literal_secret(action: str) -> bool:
+    """Detect only explicit, credential-shaped literal values in inert candidate text."""
+    return bool(
+        SECRET_ASSIGNMENT_LITERAL_RE.search(action)
+        or AUTHORIZATION_LITERAL_RE.search(action)
+        or WELL_KNOWN_TOKEN_RE.search(action)
+    )
+
+
+def _redact_literal_secrets(text: str) -> str:
+    """Remove credential-shaped literal values from optional diagnostic output."""
+    redacted = SECRET_ASSIGNMENT_LITERAL_RE.sub(
+        lambda match: match.group("prefix") + "[REDACTED]",
+        text,
+    )
+    redacted = AUTHORIZATION_LITERAL_RE.sub(
+        lambda match: match.group("prefix") + "[REDACTED]",
+        redacted,
+    )
+    return WELL_KNOWN_TOKEN_RE.sub("[REDACTED CREDENTIAL]", redacted)
 
 
 def _result(
@@ -177,7 +219,7 @@ def _combine_analyses(
         ["compound_action"] + [signal for analysis in analyses for signal in analysis["signals"]],
     )
     result["domains_detected"] = domains
-    result["sub_actions"] = sub_actions
+    result["sub_actions"] = [_redact_literal_secrets(item) for item in sub_actions]
     return result
 
 
@@ -980,6 +1022,7 @@ def _has_secret_marker(action: str) -> bool:
         SECRET_FILE_RE.search(action)
         or SECRET_MOUNT_RE.search(action)
         or SECRET_VAR_RE.search(action)
+        or _has_literal_secret(action)
         or SECRET_ENVIRONMENT_GETTER_RE.search(action)
         or normalized_secret_path
         or secret_projection
@@ -1000,6 +1043,7 @@ def _analyze_secrets(action: str) -> dict[str, Any] | None:
     named_secret_output = command == "printenv" and any(
         SECRET_NAME_RE.fullmatch(token.strip("${}")) for token in tokens[1:]
     )
+    literal_secret = _has_literal_secret(action)
     if not (_has_secret_marker(action) or named_secret_output):
         return None
 
@@ -1040,7 +1084,7 @@ def _analyze_secrets(action: str) -> dict[str, Any] | None:
             "Transmission cannot be undone; exposed credentials usually need to be revoked and replaced.",
             ["Remove the credential from the request and verify exactly what data must be sent."],
             ["The destination's ownership and data-retention behavior are not established by this action."],
-            ["secret_reference", "credential_exfiltration", "network_transfer"],
+            ["secret_reference", "credential_literal" if literal_secret else "credential_source", "credential_exfiltration", "network_transfer"],
         )
     if stage:
         staged_target = ".env" if re.search(r"(?:^|[\s/])\.env(?:[\s/]|$)", action) else "the credential-bearing file"
@@ -1065,7 +1109,7 @@ def _analyze_secrets(action: str) -> dict[str, Any] | None:
             "Printed output may persist in logs; if exposed, the credential may need replacement.",
             ["Inspect only non-sensitive key names or use a tool that redacts secret values."],
             [],
-            ["secret_reference", "secret_output"],
+            ["secret_reference", "credential_literal" if literal_secret else "credential_source", "secret_output"],
         )
     if delete:
         return _result(
@@ -2169,9 +2213,10 @@ def _is_catastrophic_delete_scope(path: str) -> bool:
             continue
         parts.append(part)
     normalized = (("/" if absolute else "") + "/".join(parts)).rstrip("/") or ("/" if absolute else ".")
-    if normalized in {"/", "/*", "/System", "~", "$HOME", "${HOME}", "/Users", "/home"}:
+    system_roots = ("/System", "/etc", "/usr", "/bin", "/sbin", "/lib", "/lib64", "/boot", "/Library")
+    if normalized in {"/", "/*", "~", "$HOME", "${HOME}", "/Users", "/home", *system_roots}:
         return True
-    broad_roots = ("~", "$HOME", "${HOME}", "/Users", "/home")
+    broad_roots = ("~", "$HOME", "${HOME}", "/Users", "/home", *system_roots)
     broad_suffixes = ("/*", "/**", "/.*")
     return any(normalized == root + suffix for root in broad_roots for suffix in broad_suffixes)
 
