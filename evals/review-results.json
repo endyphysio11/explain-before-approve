@@ -1,11 +1,11 @@
 {
   "reviewer_type": "independent",
   "review_summary": {
-    "total_awarded": 285,
+    "total_awarded": 281,
     "total_possible": 288,
-    "percentage": 0.9895833333333334,
+    "percentage": 0.9756944444444444,
     "minimum_critical_case_total": 10,
-    "scope": "Fresh read-only review of all 24 evaluation cases against the hardened analyzer output."
+    "scope": "Fresh independent read-only post-release review of all 24 evaluation cases against the hardened analyzer output."
   },
   "cases": [
     {
@@ -106,11 +106,11 @@
         "understandable": 2,
         "technically_faithful": 2,
         "risk_communicated": 2,
-        "reversibility": 2,
+        "reversibility": 1,
         "safer_alternative": 2,
         "recommendation_justified": 2
       },
-      "notes": "Clearly identifies destructive schema and data loss, keeps the database environment uncertain, and recommends target verification and tested recovery measures."
+      "notes": "The destructive operation and unknown environment are communicated well. Reversibility is conservative but omits that some databases can roll back DROP inside an uncommitted transaction."
     },
     {
       "id": "eval_drop_production",
@@ -119,11 +119,11 @@
         "understandable": 2,
         "technically_faithful": 2,
         "risk_communicated": 2,
-        "reversibility": 2,
+        "reversibility": 1,
         "safer_alternative": 2,
         "recommendation_justified": 2
       },
-      "notes": "Accurately communicates production table destruction, recovery dependence, and a logically justified do-not-approve recommendation."
+      "notes": "Correctly presents production table removal as CRITICAL and recommends against approval. The recovery discussion omits transactional rollback where supported."
     },
     {
       "id": "eval_update_all",
@@ -195,13 +195,13 @@
       "expected_risk": "CRITICAL",
       "scores": {
         "understandable": 1,
-        "technically_faithful": 1,
+        "technically_faithful": 2,
         "risk_communicated": 2,
         "reversibility": 2,
-        "safer_alternative": 2,
+        "safer_alternative": 1,
         "recommendation_justified": 2
       },
-      "notes": "Deducted 1 for understandability and 1 for technical faithfulness: it does not plainly explain that command substitution executes the hidden deletion before echo, and leaves the benign second part unnamed."
+      "notes": "The hidden root deletion is correctly detected. The explanation does not plainly say that the shell executes it before echo, and its safer option is not tailored to removing command substitution."
     },
     {
       "id": "eval_overwrite",
@@ -273,26 +273,26 @@
       "expected_risk": "HIGH",
       "scores": {
         "understandable": 2,
-        "technically_faithful": 2,
+        "technically_faithful": 1,
         "risk_communicated": 2,
         "reversibility": 2,
         "safer_alternative": 2,
         "recommendation_justified": 2
       },
-      "notes": "Defines migrations plainly, identifies unknown target and data/schema effects, explains downgrade limits, and recommends previewing changes."
+      "notes": "Database targeting, schema/data effects, downgrade uncertainty, and review steps are strong. The description omits that Alembic migration scripts are Python code capable of additional side effects."
     },
     {
       "id": "eval_bounded_delete",
       "expected_risk": "MODERATE",
       "scores": {
-        "understandable": 2,
+        "understandable": 1,
         "technically_faithful": 2,
         "risk_communicated": 2,
         "reversibility": 1,
         "safer_alternative": 2,
         "recommendation_justified": 2
       },
-      "notes": "The bounded scope, uncertainty, preview, and transaction advice are strong. Reversibility is weakened by suggesting a compensating update after deletion; accurate restoration would require reinserting known values or recovering them from a backup."
+      "notes": "The bounded target, uncertainty, preview query, and recommendation are correct. The recovery discussion uses unexplained transaction terminology, and a compensating update is imprecise for recreating a deleted row."
     },
     {
       "id": "eval_stage_env",

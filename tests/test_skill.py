@@ -99,6 +99,27 @@ class SkillContractTests(unittest.TestCase):
         ):
             self.assertIn(heading, explanation)
 
+    def test_public_recommendation_labels_preserve_structured_enums(self) -> None:
+        import importlib.util
+
+        analyzer_path = SKILL_DIR / "scripts" / "analyze_action.py"
+        spec = importlib.util.spec_from_file_location("eba_label_analyzer", analyzer_path)
+        assert spec and spec.loader
+        analyzer = importlib.util.module_from_spec(spec)
+        spec.loader.exec_module(analyzer)
+        cases = (
+            ("git status", "SAFE_TO_APPROVE", "SAFE TO APPROVE"),
+            ("rm -rf node_modules", "REVIEW_FIRST", "REVIEW FIRST"),
+            ("rm -rf /", "DO_NOT_APPROVE", "DO NOT APPROVE"),
+        )
+        for action, enum_value, public_label in cases:
+            with self.subTest(action=action):
+                analysis = analyzer.analyze_action(action)
+                self.assertEqual(analysis["recommendation"], enum_value)
+                explanation = analyzer.format_explanation(analysis)
+                self.assertIn(f"## Recommendation\n{public_label}", explanation)
+                self.assertNotIn(f"## Recommendation\n{enum_value}", explanation)
+
 
 if __name__ == "__main__":
     unittest.main()

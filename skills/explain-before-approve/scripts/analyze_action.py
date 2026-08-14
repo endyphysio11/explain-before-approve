@@ -26,6 +26,11 @@ RISK_LABELS = {
     "HIGH": "🟠 HIGH",
     "CRITICAL": "🔴 CRITICAL",
 }
+PUBLIC_RECOMMENDATIONS = {
+    "SAFE_TO_APPROVE": "SAFE TO APPROVE",
+    "REVIEW_FIRST": "REVIEW FIRST",
+    "DO_NOT_APPROVE": "DO NOT APPROVE",
+}
 
 REQUIRED_FIELDS = (
     "domain",
@@ -41,6 +46,7 @@ REQUIRED_FIELDS = (
 
 SECRET_FILE_RE = re.compile(
     r"(?:^|[\s/\\'\"])(?:\.env(?:\.[\w.-]+)?|id_(?:rsa|ed25519|ecdsa|dsa|sk)|"
+    r"etc/(?:(?:shadow|gshadow)(?:[-.][\w.-]+)?|master\.passwd|security/(?:opasswd|passwd))|"
     r"(?:credentials|secrets)(?:\.(?:json|ya?ml|toml|ini))?|service[-_]?account(?:\.json)?|\.aws/credentials|"
     r"\.ssh/(?:config|authorized_keys)|\.npmrc|\.pypirc|\.netrc|"
     r"\.docker/config\.json|\.kube/config|application_default_credentials\.json|"
@@ -272,6 +278,31 @@ def _command_name(tokens: list[str]) -> str:
     return basename(tokens[index])
 
 
+def _is_network_transfer(action: str) -> bool:
+    """Recognize commands whose visible purpose can transmit local data."""
+    tokens = _tokens(action)
+    command = _command_name(tokens)
+    lowered = [token.lower() for token in tokens]
+    if command in NETWORK_TRANSFER_COMMANDS or command in {"http", "https", "httpie", "rclone"}:
+        return True
+    if command == "aws":
+        return any(
+            lowered[index : index + 2] in (["s3", "cp"], ["s3", "sync"], ["s3api", "put-object"])
+            for index in range(max(0, len(lowered) - 1))
+        )
+    if command == "gh":
+        return any(
+            lowered[index : index + 2] == ["gist", "create"]
+            for index in range(max(0, len(lowered) - 1))
+        )
+    if command == "az":
+        return any(
+            lowered[index : index + 3] == ["storage", "blob", "upload"]
+            for index in range(max(0, len(lowered) - 2))
+        )
+    return False
+
+
 def _sql_target(action: str, operation: str) -> str:
     patterns = {
         "select": r"\bfrom\s+([\w.`\"\[\]-]+)",
@@ -444,6 +475,9 @@ def _database_client_input_files(action: str) -> list[str]:
         return []
     inputs: list[str] = []
     for index, token in enumerate(tokens):
+        if token == "<" and index + 1 < len(tokens):
+            inputs.append(tokens[index + 1])
+            continue
         if token in value_options[client] and index + 1 < len(tokens):
             inputs.append(tokens[index + 1])
             continue
@@ -456,6 +490,38 @@ def _database_client_input_files(action: str) -> list[str]:
         elif client == "sqlcmd" and len(token) > 2 and lowered.startswith("-i"):
             inputs.append(token[2:])
     return _unique(inputs)
+
+
+def _database_client_config_files(action: str) -> list[str]:
+    """Return hidden client configuration files that can alter database behavior."""
+    tokens = _tokens(action)
+    if _command_name(tokens) != "mysql":
+        return []
+    options = {"--defaults-file", "--defaults-extra-file"}
+    configs: list[str] = []
+    for index, token in enumerate(tokens):
+        if token in options and index + 1 < len(tokens):
+            configs.append(tokens[index + 1])
+            continue
+        lowered = token.lower()
+        for option in options:
+            if lowered.startswith(option + "="):
+                configs.append(token.split("=", 1)[1] or "the requested client configuration file")
+    return _unique(configs)
+
+
+def _database_config_result(target: str) -> dict[str, Any]:
+    return _result(
+        "database",
+        "HIGH",
+        "REVIEW_FIRST",
+        f"This database client loads hidden connection and behavior settings from `{target}`.",
+        ["The file may change the server, account, authentication, initialization SQL, or other client behavior not visible in the approval request."],
+        "Reversibility cannot be determined until the complete client configuration and resulting database actions are reviewed.",
+        [f"Open and review `{target}` as inert text, then specify the connection and SQL behavior explicitly before running the client."],
+        [f"The contents of `{target}` and the resulting database target are not shown."],
+        ["database_client_config", "hidden_client_config", "database_write_unknown"],
+    )
 
 
 def _database_input_result(target: str) -> dict[str, Any]:
@@ -530,8 +596,31 @@ def _database_output_result(target: str) -> dict[str, Any]:
 def _database_statement_fallback(statement: str) -> dict[str, Any]:
     """Conservatively classify client statements outside the supported SQL subset."""
     stripped = statement.strip()
+    program_match = re.match(
+        r"^\\copy\b[\s\S]*?\bto\s+program\s+(['\"])([\s\S]*?)\1\s*;?$",
+        stripped,
+        re.IGNORECASE,
+    )
+    if program_match:
+        embedded = program_match.group(2).strip()
+        context = _result(
+            "database",
+            "HIGH",
+            "REVIEW_FIRST",
+            "This database-client copy statement sends query output to an external program.",
+            ["The external program receives database content and can change files, services, credentials, or other resources."],
+            "Recovery depends on the database output and every operation performed by the external program.",
+            ["Remove `TO PROGRAM`, inspect the query output separately, and review the external command as its own action."],
+            [],
+            ["database_client_program", "embedded_code", "arbitrary_execution"],
+        )
+        return _combine_analyses(
+            [context, analyze_action(embedded)],
+            ["database-client copy to program", embedded],
+            "This database-client program action",
+        )
     shell_match = re.match(
-        r"^(?:\\!|!|\\system\b|system\b)\s*(.*)$",
+        r"^(?:\\!|!!|!|\\system\b|system\b)\s*(.*)$",
         stripped,
         re.IGNORECASE | re.DOTALL,
     )
@@ -702,7 +791,7 @@ def _split_top_level_detailed(action: str) -> tuple[list[str], list[str]]:
         if substitution_depth == 0:
             if action[index : index + 2] in ("&&", "||", "|&"):
                 separator = action[index : index + 2]
-            elif char in (";", "\n", "|"):
+            elif char in (";", "\n", "|") and not (char == "|" and index and action[index - 1] == ">"):
                 separator = char
             elif char == "&" and next_char != ">" and (index == 0 or action[index - 1] != ">"):
                 separator = char
@@ -848,8 +937,7 @@ def _secret_pipeline_transfer(action: str) -> dict[str, Any] | None:
         )
         if secret_analysis is not None or raw_command in {"env", "printenv", "set", "export"}:
             secret_output_seen = True
-        command = _command_name(part_tokens)
-        if index and separators[index - 1] in {"|", "|&"} and secret_output_seen and command in NETWORK_TRANSFER_COMMANDS:
+        if index and separators[index - 1] in {"|", "|&"} and secret_output_seen and _is_network_transfer(part):
             return _result(
                 "secrets",
                 "CRITICAL",
@@ -925,7 +1013,7 @@ def _analyze_secrets(action: str) -> dict[str, Any] | None:
             re.IGNORECASE,
         )
     )
-    transmit = command in NETWORK_TRANSFER_COMMANDS
+    transmit = _is_network_transfer(action)
     stage = command == "git" and bool(re.search(r"\bgit\s+(?:add|commit)\b", lowered))
     print_value = command in {
         "cat", "echo", "printf", "printenv", "env", "type", "get-content", "write-output", "write-host",
@@ -1017,6 +1105,38 @@ def _analyze_secrets(action: str) -> dict[str, Any] | None:
 
 
 def _analyze_database(action: str) -> dict[str, Any] | None:
+    tokens = _tokens(action)
+    command = _command_name(tokens)
+    pager_payload = ""
+    if command in {"psql", "mysql", "sqlite3", "sqlcmd"}:
+        assignments: dict[str, str] = {}
+        for token in tokens:
+            if not re.match(r"^[A-Za-z_][A-Za-z0-9_]*=", token):
+                break
+            key, value = token.split("=", 1)
+            assignments[key.upper()] = value
+        pager_enabled = bool(
+            re.search(r"(?:^|\s)(?:-P\s+pager=(?:always|on)|--pset(?:=|\s+)pager=(?:always|on)|--pager(?:=|\s))", action, re.IGNORECASE)
+        )
+        if pager_enabled:
+            pager_payload = assignments.get("PSQL_PAGER", "") or assignments.get("MYSQL_PAGER", "") or assignments.get("PAGER", "")
+    if pager_payload:
+        context = _result(
+            "database",
+            "HIGH",
+            "REVIEW_FIRST",
+            "This database client is configured to run an external pager for its output.",
+            ["The pager command can change files, services, credentials, or other resources available to the current user."],
+            "Recovery depends entirely on the configured pager command.",
+            ["Remove the pager environment setting and display a limited result directly before using any external output program."],
+            [],
+            ["database_client_pager", "embedded_code", "arbitrary_execution"],
+        )
+        return _combine_analyses(
+            [context, analyze_action(pager_payload)],
+            ["configure database pager", pager_payload],
+            "This database-client pager action",
+        )
     sqlite_meta = _sqlite_meta_analysis(action)
     if sqlite_meta is not None:
         return sqlite_meta
@@ -1024,13 +1144,16 @@ def _analyze_database(action: str) -> dict[str, Any] | None:
     output_target = _database_client_output_target(action)
     client_statements = _database_client_statements(action)
     input_files = _database_client_input_files(action)
-    if client_statements or input_files:
+    config_files = _database_client_config_files(action)
+    if client_statements or input_files or config_files:
         contextual_statements = [
             statement + (" -- production" if production else "")
             for statement in client_statements
         ]
-        analyses = [_database_input_result(target) for target in input_files]
-        sub_actions = [f"execute SQL input file {target}" for target in input_files]
+        analyses = [_database_config_result(target) for target in config_files]
+        sub_actions = [f"load database client configuration {target}" for target in config_files]
+        analyses.extend(_database_input_result(target) for target in input_files)
+        sub_actions.extend(f"execute SQL input file {target}" for target in input_files)
         for statement in contextual_statements:
             analysis = _analyze_secrets(statement) or _analyze_database(statement)
             analyses.append(analysis if analysis is not None else _database_statement_fallback(statement))
@@ -1051,7 +1174,7 @@ def _analyze_database(action: str) -> dict[str, Any] | None:
 
     analysis_action = _expand_mysql_executable_comments(action)
     lowered = _mask_sql_literals(analysis_action).lower().strip()
-    command = _command_name(_tokens(action))
+    command = _command_name(tokens)
     direct_sql = bool(re.match(r"^(?:select|insert|update|delete|alter|drop|truncate|create)\b", lowered))
     database_client = command in {"psql", "mysql", "sqlite3", "sqlcmd"}
     sql_match = (
@@ -1330,7 +1453,7 @@ def _git_execution_payload(action: str) -> tuple[str, str] | None:
         r"diff\.(?:external|[^.]+\.(?:command|textconv))",
         r"filter\.[^.]+\.(?:clean|smudge|process)",
         r"credential\.[^.]+\.helper|credential\.helper",
-        r".*\.(?:command|program|helper)",
+        r".*\.(?:command|program|helper|cmd)",
     )
     execution_environment = {
         "GIT_SSH", "GIT_SSH_COMMAND", "GIT_PROXY_COMMAND", "GIT_EXTERNAL_DIFF",
@@ -1394,6 +1517,31 @@ def _git_execution_payload(action: str) -> tuple[str, str] | None:
                 return option, token[len(prefix) :]
         if lowered.startswith("ext::"):
             return "ext:: transport", token[5:]
+
+    for index, token in enumerate(tokens):
+        lowered = token.lower()
+        if lowered == "--extcmd" and index + 1 < len(tokens):
+            return "--extcmd", tokens[index + 1]
+        if lowered.startswith("--extcmd="):
+            return "--extcmd", token.split("=", 1)[1]
+
+    lowered_tokens = [token.lower() for token in tokens]
+    for index in range(len(tokens) - 1):
+        if lowered_tokens[index : index + 2] == ["submodule", "foreach"] and index + 2 < len(tokens):
+            return "submodule foreach", tokens[index + 2]
+        if lowered_tokens[index : index + 2] == ["bisect", "run"] and index + 2 < len(tokens):
+            return "bisect run", " ".join(tokens[index + 2 :])
+    shell_filter_options = {
+        "--tree-filter", "--index-filter", "--commit-filter", "--msg-filter",
+        "--env-filter", "--parent-filter", "--setup",
+    }
+    for index, token in enumerate(tokens):
+        lowered = token.lower()
+        if lowered in shell_filter_options and index + 1 < len(tokens):
+            return lowered, tokens[index + 1]
+        for option in shell_filter_options:
+            if lowered.startswith(option + "="):
+                return option, token.split("=", 1)[1]
     return None
 
 
@@ -2000,7 +2148,36 @@ def _rm_targets(tokens: list[str]) -> list[str]:
     return [token for token in tokens[index + 1 :] if not token.startswith("-")]
 
 
-def _output_redirection(action: str) -> tuple[int, str, str] | None:
+def _is_catastrophic_delete_scope(path: str) -> bool:
+    """Recognize broad destructive path syntax without expanding variables or globs."""
+    raw = re.sub(r"/{2,}", "/", path.strip("'\""))
+    if re.fullmatch(r"\$\{HOME%/\*\}/(?:\*|\*\*|\.\*)/?", raw):
+        return True
+    home_parent = re.fullmatch(r"(?:~|\$HOME|\$\{HOME\})/\.\.(?:/(?:\*|\*\*|\.\*))?/?", raw)
+    if home_parent:
+        return True
+    absolute = raw.startswith("/")
+    parts: list[str] = []
+    for part in raw.split("/"):
+        if part in {"", "."}:
+            continue
+        if part == "..":
+            if parts and parts[-1] != "..":
+                parts.pop()
+            elif not absolute:
+                parts.append(part)
+            continue
+        parts.append(part)
+    normalized = (("/" if absolute else "") + "/".join(parts)).rstrip("/") or ("/" if absolute else ".")
+    if normalized in {"/", "/*", "/System", "~", "$HOME", "${HOME}", "/Users", "/home"}:
+        return True
+    broad_roots = ("~", "$HOME", "${HOME}", "/Users", "/home")
+    broad_suffixes = ("/*", "/**", "/.*")
+    return any(normalized == root + suffix for root in broad_roots for suffix in broad_suffixes)
+
+
+def _output_redirections(action: str) -> list[tuple[int, str, str]]:
+    redirections: list[tuple[int, str, str]] = []
     quote: str | None = None
     escaped = False
     substitution_depth = 0
@@ -2034,7 +2211,7 @@ def _output_redirection(action: str) -> tuple[int, str, str] | None:
             index += 1
             continue
         if char == ">" and substitution_depth == 0 and following != "(":
-            operator = ">>" if following == ">" else ">"
+            operator = ">>" if following == ">" else ">|" if following == "|" else ">"
             target_start = index + len(operator)
             while target_start < len(action) and action[target_start].isspace():
                 target_start += 1
@@ -2048,38 +2225,72 @@ def _output_redirection(action: str) -> tuple[int, str, str] | None:
                     target_start += 1
             target_match = re.match(r"[^\s;&|]+", action[target_start:])
             target = target_match.group(0) if target_match else ""
-            return index, operator, target.strip("'\"") or "the destination file"
+            redirections.append((index, operator, target.strip("'\"") or "the destination file"))
+            index = target_start + (len(target_match.group(0)) if target_match else 0)
+            continue
         index += 1
-    return None
+    return redirections
 
 
-def _redirection_details(action: str) -> tuple[str, str, bool]:
-    redirection = _output_redirection(action)
+def _output_redirection(action: str) -> tuple[int, str, str] | None:
+    redirections = _output_redirections(action)
+    return redirections[0] if redirections else None
+
+
+def _redirection_details(
+    action: str,
+    redirection: tuple[int, str, str] | None = None,
+) -> tuple[str, str, bool]:
+    redirection = redirection or _output_redirection(action)
     if redirection is None:
         return "the destination file", "new content", False
     position, operator, target = redirection
-    prefix = action[:position].strip()
+    raw_prefix = action[:position]
+    descriptor_match = re.search(r"(\d+)$", raw_prefix)
+    descriptor = int(descriptor_match.group(1)) if descriptor_match else 1
+    prefix = (raw_prefix[: descriptor_match.start()] if descriptor_match else raw_prefix).strip()
     content = "new content"
-    echo_match = re.match(r"(?:echo|printf)\s+(.+)$", prefix, re.IGNORECASE)
+    echo_match = re.match(r"(?:echo|printf)\s+(.+)$", prefix, re.IGNORECASE) if descriptor == 1 else None
     if echo_match:
         content = echo_match.group(1).strip().strip("'\"") or "an empty value"
+    elif descriptor != 1:
+        content = f"output from file descriptor {descriptor}"
     return target, content, operator == ">>"
 
 
-def _redirection_result(action: str) -> dict[str, Any] | None:
-    if _output_redirection(action) is None:
+def _redirection_result(
+    action: str,
+    redirection: tuple[int, str, str] | None = None,
+) -> dict[str, Any] | None:
+    selected = redirection or _output_redirection(action)
+    if selected is None:
         return None
-    target, content, append = _redirection_details(action)
-    summary = (
-        f"This appends `{content}` to `{target}`."
-        if append
-        else f"This replaces the contents of `{target}` with `{content}`; if the file does not exist, it creates it."
+    target, content, append = _redirection_details(action, selected)
+    position = selected[0]
+    descriptor_match = re.search(r"(\d+)$", action[:position])
+    descriptor = int(descriptor_match.group(1)) if descriptor_match else 1
+    superseded = any(
+        later[0] > position
+        and (int(match.group(1)) if (match := re.search(r"(\d+)$", action[: later[0]])) else 1) == descriptor
+        for later in _output_redirections(action)
     )
-    impact = [
-        f"Existing contents in `{target}` will remain and new output will be added at the end."
-        if append
-        else f"Any existing contents in `{target}` will be discarded before new output is written."
-    ]
+    if superseded and not append:
+        summary = f"This truncates `{target}`, then a later redirection sends file descriptor {descriptor} somewhere else."
+        impact = [f"Any existing contents in `{target}` are discarded even though the command's output is redirected again later."]
+    elif superseded:
+        summary = f"This opens or creates `{target}` for appending, then redirects file descriptor {descriptor} somewhere else."
+        impact = [f"`{target}` may be created, but the visible command output is redirected again before it can be appended here."]
+    else:
+        summary = (
+            f"This appends `{content}` to `{target}`."
+            if append
+            else f"This replaces the contents of `{target}` with `{content}`; if the file does not exist, it creates it."
+        )
+        impact = [
+            f"Existing contents in `{target}` will remain and new output will be added at the end."
+            if append
+            else f"Any existing contents in `{target}` will be discarded before new output is written."
+        ]
     return _result(
         "filesystem",
         "MODERATE",
@@ -2154,11 +2365,106 @@ def _find_embedded_action(tokens: list[str]) -> str:
     return ""
 
 
+def _explicit_file_output_result(action: str) -> dict[str, Any] | None:
+    """Recognize common commands that write files without shell redirection."""
+    tokens = _tokens(action)
+    command = _command_name(tokens)
+    target = ""
+    append = False
+
+    if command == "tee":
+        append = any(token in {"-a", "--append"} for token in tokens)
+        target = next((token for token in tokens[1:] if not token.startswith("-")), "")
+    elif command == "dd":
+        target = next((token.split("=", 1)[1] for token in tokens if token.lower().startswith("of=")), "")
+    elif command == "sort":
+        for index, token in enumerate(tokens):
+            if token in {"-o", "--output"} and index + 1 < len(tokens):
+                target = tokens[index + 1]
+                break
+            if token.startswith("--output="):
+                target = token.split("=", 1)[1]
+                break
+    elif command == "sed" and any(
+        token == "--in-place" or token.startswith(("--in-place=", "-i"))
+        for token in tokens[1:]
+    ):
+        target = next((token for token in reversed(tokens[1:]) if not token.startswith("-")), "")
+    elif command == "awk" and (
+        "--in-place" in tokens
+        or any(token.startswith("--in-place=") for token in tokens)
+        or any(tokens[index : index + 2] == ["-i", "inplace"] for index in range(len(tokens) - 1))
+    ):
+        target = next((token for token in reversed(tokens[1:]) if not token.startswith("-")), "")
+    elif command == "tar":
+        for index, token in enumerate(tokens):
+            if token in {"-f", "--file"} and index + 1 < len(tokens):
+                target = tokens[index + 1]
+                break
+            if token.startswith("--file="):
+                target = token.split("=", 1)[1]
+                break
+            if token.startswith("-") and "f" in token[1:] and index + 1 < len(tokens):
+                target = tokens[index + 1]
+                break
+    elif command == "openssl" and any(token.lower() == "dgst" for token in tokens[1:]):
+        for index, token in enumerate(tokens):
+            if token == "-out" and index + 1 < len(tokens):
+                target = tokens[index + 1]
+                break
+    elif command == "zip":
+        target = next((token for token in tokens[1:] if not token.startswith("-")), "")
+
+    if not target:
+        return None
+    if command == "sed":
+        backup_suffix = next(
+            (
+                token[2:]
+                for token in tokens[1:]
+                if token.startswith("-i") and token != "-i" and token[2:]
+            ),
+            "",
+        )
+        backup_suffix = next(
+            (token.split("=", 1)[1] for token in tokens[1:] if token.startswith("--in-place=")),
+            backup_suffix,
+        )
+        if backup_suffix:
+            backup_target = target + backup_suffix
+            return _result(
+                "filesystem",
+                "MODERATE",
+                "REVIEW_FIRST",
+                f"This edits `{target}` in place and creates or replaces the backup `{backup_target}`.",
+                [f"The contents of `{target}` change, and any existing `{backup_target}` may be replaced by the pre-edit version."],
+                f"The backup may help restore `{target}`, but a previous `{backup_target}` is not preserved.",
+                [f"Preview the transformation without in-place mode, then preserve any existing `{backup_target}` before editing `{target}`."],
+                [f"The action does not show whether `{backup_target}` already contains unique data."],
+                ["filesystem_write", "possible_overwrite", "backup_file", "writer_sed"],
+            )
+    operation = "appends output to" if append else "writes output to"
+    return _result(
+        "filesystem",
+        "MODERATE",
+        "REVIEW_FIRST",
+        f"This {command} action {operation} `{target}`.",
+        [f"`{target}` may be created or {'changed by appending data' if append else 'have its existing contents replaced'}."],
+        f"Restoring previous contents of `{target}` requires version control, editor history, or a backup.",
+        [f"Inspect the input and use a new confirmed output path instead of `{target}` until replacement is intended."],
+        [f"The action does not show whether `{target}` already contains unique data."],
+        ["filesystem_write", "file_append" if append else "possible_overwrite", f"writer_{command}"],
+    )
+
+
 def _analyze_filesystem(action: str) -> dict[str, Any] | None:
     lowered = action.lower().strip()
     tokens = _tokens(action)
     command = _command_name(tokens)
     redirected_result = _redirection_result(action)
+    explicit_output = _explicit_file_output_result(action)
+    if explicit_output is not None:
+        return explicit_output
     if command in {"tree", "less"}:
         output_options = {"-o", "--output"} if command == "tree" else {"-o", "-O", "--log-file", "--LOG-FILE"}
         output_target = None
@@ -2193,7 +2499,7 @@ def _analyze_filesystem(action: str) -> dict[str, Any] | None:
             paths.append(token)
         paths = paths or ["."]
         normalized = {path.rstrip("/") or "/" for path in paths}
-        catastrophic = bool(normalized & {"/", "/*", "~", "$HOME", "${HOME}", "/Users", "/home", "/System"})
+        catastrophic = any(_is_catastrophic_delete_scope(path) for path in paths)
         repository_wide = bool(normalized & {".", "./", "*"})
         delete_action = "-delete" in lowered
         exec_action = bool(re.search(r"(?:^|\s)-(?:exec|execdir|ok|okdir)(?:\s|$)", lowered))
@@ -2331,9 +2637,8 @@ def _analyze_filesystem(action: str) -> dict[str, Any] | None:
         recursive = bool(re.search(r"(?:\s-[a-z]*r|--recursive)", lowered))
         force = bool(re.search(r"(?:\s-[a-z]*f|--force)", lowered))
         normalized = {target.rstrip("/") or "/" for target in targets}
-        catastrophic = bool(
-            normalized & {"/", "/*", "~", "$HOME", "${HOME}", "/Users", "/home", "/System"}
-            or "--no-preserve-root" in lowered
+        catastrophic = any(_is_catastrophic_delete_scope(target) for target in targets) or (
+            "--no-preserve-root" in lowered
         )
         repository_wide = bool(normalized & {".", "./", "*"})
         regenerable = bool(
@@ -2553,7 +2858,87 @@ def _analyze_unknown(action: str) -> dict[str, Any]:
     )
 
 
+def _execution_wrapper_payload(action: str) -> tuple[str, str] | None:
+    """Extract a visible command delegated through a shell-like execution wrapper."""
+    tokens = _tokens(action)
+    command = _command_name(tokens)
+    command_index = next(
+        (
+            index
+            for index, token in enumerate(tokens)
+            if token.replace("\\", "/").rsplit("/", 1)[-1].lower() == command
+        ),
+        -1,
+    )
+    if command_index < 0:
+        return None
+    if command == "busybox" and command_index + 2 < len(tokens):
+        shell = tokens[command_index + 1].replace("\\", "/").rsplit("/", 1)[-1].lower()
+        if shell in {"sh", "ash", "bash"}:
+            for index in range(command_index + 2, len(tokens) - 1):
+                option = tokens[index]
+                if option.startswith("-") and "c" in option[1:]:
+                    return f"busybox {shell}", tokens[index + 1]
+    if command in {"bash", "sh", "zsh", "ksh", "dash", "fish"}:
+        for index in range(command_index + 1, len(tokens) - 1):
+            option = tokens[index]
+            if option.startswith("-") and "c" in option[1:]:
+                return command, tokens[index + 1]
+        return None
+    if command == "watch":
+        value_options = {"-n", "--interval", "-d", "--differences", "-x", "--exec"}
+        index = command_index + 1
+        while index < len(tokens):
+            token = tokens[index]
+            if token in value_options:
+                index += 2
+            elif token.startswith("-"):
+                index += 1
+            else:
+                break
+        return (command, " ".join(tokens[index:])) if index < len(tokens) else None
+    if command == "xargs":
+        value_options = {"-E", "-I", "-L", "-n", "-P", "-s", "--eof", "--replace", "--max-lines", "--max-args", "--max-procs", "--max-chars"}
+        index = command_index + 1
+        while index < len(tokens):
+            token = tokens[index]
+            if token in value_options:
+                index += 2
+            elif token.startswith("-"):
+                index += 1
+            else:
+                break
+        return (command, " ".join(tokens[index:])) if index < len(tokens) else None
+    return None
+
+
+def _analyze_execution_wrapper(action: str) -> dict[str, Any] | None:
+    payload = _execution_wrapper_payload(action)
+    if payload is None:
+        return None
+    wrapper, embedded = payload
+    context = _result(
+        "unknown",
+        "HIGH",
+        "REVIEW_FIRST",
+        f"This uses `{wrapper}` to execute an embedded command.",
+        ["The embedded command can access and change resources available to the current user."],
+        "Recovery depends entirely on the embedded command.",
+        ["Review the embedded command as a separate explicit action before using the execution wrapper."],
+        [],
+        ["execution_wrapper", "embedded_code", "arbitrary_execution"],
+    )
+    return _combine_analyses(
+        [analyze_action(embedded), context],
+        [embedded, f"execute through {wrapper}"],
+        "This wrapped execution",
+    )
+
+
 def _analyze_single(action: str) -> dict[str, Any]:
+    wrapped = _analyze_execution_wrapper(action)
+    if wrapped is not None:
+        return wrapped
     for analyzer in (
         _analyze_secrets,
         _analyze_database,
@@ -2580,12 +2965,15 @@ def analyze_action(action: str) -> dict[str, Any]:
     if not sub_actions:
         sub_actions = [candidate]
     analyses = [_analyze_single(item) for item in sub_actions]
-    redirection = _redirection_result(candidate)
-    if redirection is not None and not any(
-        "filesystem_write" in analysis["signals"] for analysis in analyses
-    ):
+    for redirection_spec in _output_redirections(candidate):
+        redirection = _redirection_result(candidate, redirection_spec)
+        if redirection is None:
+            continue
+        target = redirection_spec[2]
+        if any(target in json.dumps(analysis) for analysis in analyses):
+            continue
         analyses.append(redirection)
-        sub_actions.append("output redirection")
+        sub_actions.append(f"output redirection to {target}")
     wrapper_output = _wrapper_output_result(candidate)
     if wrapper_output is not None:
         analyses.append(wrapper_output)
@@ -2614,7 +3002,7 @@ def format_explanation(analysis: dict[str, Any]) -> str:
         f"## What could change\n{impact}{uncertainty}\n\n"
         f"## Can it be undone?\n{analysis['reversibility']}\n\n"
         f"## Safer option\n{safer}\n\n"
-        f"## Recommendation\n{analysis['recommendation']}"
+        f"## Recommendation\n{PUBLIC_RECOMMENDATIONS[analysis['recommendation']]}"
     )
 
 
