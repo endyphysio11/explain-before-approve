@@ -73,7 +73,17 @@ SECRET_VAR_RE = re.compile(
     re.IGNORECASE,
 )
 SECRET_NAME_RE = re.compile(r"^" + SECRET_NAME_PATTERN + r"$", re.IGNORECASE)
+EXPLICIT_SECRET_NAME_PATTERN = (
+    r"(?:PASSWORD|API[_-]?KEY|ACCESS[_-]?TOKEN|AUTH[_-]?TOKEN|GITHUB[_-]?TOKEN|"
+    r"PRIVATE[_-]?KEY|DATABASE[_-]?PASSWORD|DB[_-]?PASSWORD|SECRET[_-]?KEY)"
+)
 SECRET_LITERAL_VALUE_PATTERN = r"[A-Za-z0-9_./+=:@-]{12,}"
+EXPLICIT_SECRET_ASSIGNMENT_LITERAL_RE = re.compile(
+    r"(?<![A-Za-z0-9_-])(?P<prefix>" + EXPLICIT_SECRET_NAME_PATTERN + r"\s*(?:=|:)\s*)"
+    r"(?:(?P<quote>['\"])(?P<quoted_value>[^'\"\r\n]+)(?P=quote)|"
+    r"(?P<value>[^\s'\";&|]+))",
+    re.IGNORECASE,
+)
 SECRET_ASSIGNMENT_LITERAL_RE = re.compile(
     r"(?<![A-Za-z0-9_-])(?P<prefix>" + SECRET_NAME_PATTERN + r"\s*(?:=|:)\s*['\"]?)"
     r"(?P<value>" + SECRET_LITERAL_VALUE_PATTERN + r")",
@@ -148,7 +158,8 @@ def _unique(items: list[str]) -> list[str]:
 def _has_literal_secret(action: str) -> bool:
     """Detect only explicit, credential-shaped literal values in inert candidate text."""
     return bool(
-        SECRET_ASSIGNMENT_LITERAL_RE.search(action)
+        EXPLICIT_SECRET_ASSIGNMENT_LITERAL_RE.search(action)
+        or SECRET_ASSIGNMENT_LITERAL_RE.search(action)
         or AUTHORIZATION_LITERAL_RE.search(action)
         or WELL_KNOWN_TOKEN_RE.search(action)
     )
@@ -156,9 +167,17 @@ def _has_literal_secret(action: str) -> bool:
 
 def _redact_literal_secrets(text: str) -> str:
     """Remove credential-shaped literal values from optional diagnostic output."""
+    def redact_explicit_assignment(match: re.Match[str]) -> str:
+        quote = match.group("quote") or ""
+        return match.group("prefix") + quote + "[REDACTED]" + quote
+
+    redacted = EXPLICIT_SECRET_ASSIGNMENT_LITERAL_RE.sub(
+        redact_explicit_assignment,
+        text,
+    )
     redacted = SECRET_ASSIGNMENT_LITERAL_RE.sub(
         lambda match: match.group("prefix") + "[REDACTED]",
-        text,
+        redacted,
     )
     redacted = AUTHORIZATION_LITERAL_RE.sub(
         lambda match: match.group("prefix") + "[REDACTED]",

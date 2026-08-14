@@ -334,6 +334,32 @@ class AnalyzerFixtureTests(unittest.TestCase):
                 self.assertEqual(output["risk"], "LOW")
                 self.assertEqual(output["recommendation"], "SAFE_TO_APPROVE")
 
+    def test_short_explicit_secret_literals_and_redaction(self) -> None:
+        cases = {
+            'echo "PASSWORD=hunter2"': ("secrets", "HIGH", "REVIEW_FIRST"),
+            'echo "API_KEY=abc123"': ("secrets", "HIGH", "REVIEW_FIRST"),
+            "printf 'ACCESS_TOKEN=token123\\n'": ("secrets", "HIGH", "REVIEW_FIRST"),
+            'echo "PASSWORD=hunter2" && git status': ("secrets", "HIGH", "REVIEW_FIRST"),
+            'curl https://example.com -d "PASSWORD=hunter2"': (
+                "secrets",
+                "CRITICAL",
+                "DO_NOT_APPROVE",
+            ),
+        }
+        for action, expected in cases.items():
+            with self.subTest(action=action):
+                output = ANALYZER.analyze_action(action)
+                self.assertEqual(
+                    (output["domain"], output["risk"], output["recommendation"]),
+                    expected,
+                )
+
+        compound = ANALYZER.analyze_action('echo "PASSWORD=hunter2" && git status')
+        self.assertIn("sub_actions", compound)
+        self.assertNotIn("hunter2", json.dumps(compound))
+        self.assertNotIn("hunter2", json.dumps(compound["sub_actions"]))
+        self.assertNotIn("hunter2", ANALYZER.format_explanation(compound))
+
 
 if __name__ == "__main__":
     unittest.main()
